@@ -84,14 +84,18 @@ object App {
         path: String,
         hash: String)
 
-      val hashPairRdd: RDD[HashPair] = fRdd.repartition(NUM_PARTITIONS).map(s => {
+      if (fRdd.getNumPartitions > NUM_PARTITIONS) {
+        fRdd = fRdd.repartition(NUM_PARTITIONS)
+      }
+      val hashPairRdd: RDD[HashPair] = fRdd.map(s => {
         import java.security.{DigestInputStream, MessageDigest}
-        val hdfs = FileSystem.get(serializableConf.get())
+        val hadoopConfig = serializableConf.get()
+        val hdfs = FileSystem.get(hadoopConfig)
         val in = hdfs.open(new Path(s))
         val digest = MessageDigest.getInstance("SHA-256")
         try {
           val dis = new DigestInputStream(in, digest)
-          val buffer = new Array[Byte](BUFFER_SIZE)
+          val buffer = new Array[Byte](hadoopConfig.getInt("dfs.blocksize", BUFFER_SIZE))
           while (dis.read(buffer) >= 0) {}
           dis.close()
           HashPair(s, digest.digest.map("%02x".format(_)).mkString)
