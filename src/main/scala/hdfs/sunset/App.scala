@@ -2,8 +2,11 @@ package hdfs.sunset
 
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.apache.log4j.{LogManager, Logger}
+import org.apache.spark.Partitioner
+import org.apache.spark.api.java.{JavaRDD, JavaPairRDD}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK
 
 import java.io.File
 
@@ -69,39 +72,79 @@ object App {
     if (hdfs.exists(outPath)) {
       logger.error(s"output directory already exists: $outPath")
     } else {
+      def genPair(fss: Seq[FileStatus]): JavaPairRDD[String, Long] =
+        new JavaPairRDD(spark.sparkContext.parallelize(
+          fss.filter(_.isFile).map(fs => (fs.getPath.toString, fs.getLen))))
+
       val fss0: Seq[FileStatus] = hdfs.listStatus(config.dirs.map(fileToPath).toArray)
-      var fRdd: RDD[String] = spark.sparkContext
-        .parallelize(fss0.filter(_.isFile).map(_.getPath.toString))
+      var sizePairRdd: JavaPairRDD[String, Long] = genPair(fss0)
       var dirs: Seq[Path] = fss0.filter(fs => fs.isDirectory && !fs.getPath.getName.startsWith(".")).map(_.getPath)
+
       while (dirs.nonEmpty) {
         val fss: Seq[FileStatus] = hdfs.listStatus(dirs.toArray)
-        fRdd = fRdd.union(spark.sparkContext
-          .parallelize(fss.filter(_.isFile).map(_.getPath.toString)))
+        sizePairRdd = sizePairRdd.union(genPair(fss))
         dirs = fss.filter(fs => fs.isDirectory && !fs.getPath.getName.startsWith(".")).map(_.getPath)
       }
 
-      case class HashPair(
-        path: String,
-        hash: String)
+      val numPartitions = Math.min(sizePairRdd.getNumPartitions, NUM_PARTITIONS)
+      def fn0 = (x: (String, Long)) => x._2 >= 1024L * 1024L * 1024L * 1024L
+      def fn1 = (x: (String, Long)) => x._2
+      def fn2 = (x: (String, Long)) => x._1
+      val hugeFileRdd = sizePairRdd.filter(fn0)
+        .sortBy(fn1, false, numPartitions)
+        .map(fn2)
+        .zipWithIndex()
 
-      if (fRdd.getNumPartitions > NUM_PARTITIONS) {
-        fRdd = fRdd.repartition(NUM_PARTITIONS)
-      }
-      val hashPairRdd: RDD[HashPair] = fRdd.map(s => {
-        import java.security.{DigestInputStream, MessageDigest}
-        val hadoopConfig = serializableConf.get()
-        val hdfs = FileSystem.get(hadoopConfig)
-        val in = hdfs.open(new Path(s))
-        val digest = MessageDigest.getInstance("SHA-256")
-        try {
-          val dis = new DigestInputStream(in, digest)
-          val buffer = new Array[Byte](hadoopConfig.getInt("dfs.blocksize", BUFFER_SIZE))
-          while (dis.read(buffer) >= 0) {}
-          dis.close()
-          HashPair(s, digest.digest.map("%02x".format(_)).mkString)
-        } finally {
-          in.close()
+      val hugeFileMap = spark.sparkContext.broadcast(hugeFileRdd.collect().toMap)
+
+      object SizePairPartitioner extends Partitioner {
+        private val _numPartitions: Int = hugeFileRdd.getNumPartitions
+        override def numPartitions: Int = _numPartitions
+
+        override def getPartition(key: Any): Int = {
+          val _hugeFileMap: Map[String, Long] = hugeFileMap.value
+          key match {
+            case (path: String, size: Long) =>
+              if (_hugeFileMap.contains(path)) {
+                (_hugeFileMap(path) % _numPartitions).toInt
+              } else {
+                (size % _numPartitions).toInt
+              }
+            case path: String =>
+              if (_hugeFileMap.contains(path)) {
+                (_hugeFileMap(path) % _numPartitions).toInt
+              } else {
+                path.hashCode.abs % _numPartitions
+              }
+            case _ => 0
+          }
         }
+      }
+      case class HashPair(path: String, hash: String)
+
+      sizePairRdd = sizePairRdd.partitionBy(SizePairPartitioner).persist(MEMORY_AND_DISK)
+      val pathRdd: RDD[String] = JavaRDD.toRDD(sizePairRdd.map(
+        new org.apache.spark.api.java.function.Function[(String, Long), String]() {
+          override def call(item: (String, Long)): String = {
+            item._1
+          }
+      }))
+
+      val hashPairRdd: RDD[HashPair] = pathRdd.map(s => {
+          import java.security.{DigestInputStream, MessageDigest}
+          val hadoopConfig = serializableConf.get()
+          val hdfs = FileSystem.get(hadoopConfig)
+          val in = hdfs.open(new Path(s))
+          val digest = MessageDigest.getInstance("SHA-256")
+          try {
+            val dis = new DigestInputStream(in, digest)
+            val buffer = new Array[Byte](hadoopConfig.getInt("dfs.blocksize", BUFFER_SIZE))
+            while (dis.read(buffer) >= 0) {}
+            dis.close()
+            HashPair(s, digest.digest.map("%02x".format(_)).mkString)
+          } finally {
+            in.close()
+          }
       })
       hashPairRdd.saveAsTextFile(config.outputDir.toString)
     }
