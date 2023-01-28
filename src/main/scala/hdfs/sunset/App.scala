@@ -18,7 +18,8 @@ object App {
 
   case class Config(
     outputDir: File = new File("."),
-    dirs: Seq[File] = Seq())
+    dirs: Seq[File] = Seq(),
+    numPartitions: Int = NUM_PARTITIONS)
 
   def main(args: Array[String]): Unit = {
     import scopt.OParser
@@ -33,6 +34,11 @@ object App {
           .valueName("<path>")
           .action((x, c) => c.copy(outputDir = x))
           .text("output directory for hash values"),
+        opt[Int]('p', "parallel")
+          .required()
+          .valueName("<number>")
+          .action((x, c) => c.copy(numPartitions = x))
+          .text("number of parallelism"),
         help("help").text("prints this usage text"),
         arg[File]("<path>...")
           .unbounded()
@@ -86,35 +92,33 @@ object App {
         dirs = fss.filter(fs => fs.isDirectory && !fs.getPath.getName.startsWith(".")).map(_.getPath)
       }
 
-      val numPartitions = Math.min(sizePairRdd.getNumPartitions, NUM_PARTITIONS)
       def fn0 = (x: (String, Long)) => x._2 >= 1024L * 1024L * 1024L * 1024L
       def fn1 = (x: (String, Long)) => x._2
       def fn2 = (x: (String, Long)) => x._1
       val hugeFileRdd = sizePairRdd.filter(fn0)
-        .sortBy(fn1, false, numPartitions)
+        .sortBy(fn1, false, config.numPartitions)
         .map(fn2)
         .zipWithIndex()
 
       val hugeFileMap = spark.sparkContext.broadcast(hugeFileRdd.collect().toMap)
 
       object SizePairPartitioner extends Partitioner {
-        private val _numPartitions: Int = hugeFileRdd.getNumPartitions
-        override def numPartitions: Int = _numPartitions
+        override def numPartitions: Int = config.numPartitions
 
         override def getPartition(key: Any): Int = {
           val _hugeFileMap: Map[String, Long] = hugeFileMap.value
           key match {
             case (path: String, size: Long) =>
               if (_hugeFileMap.contains(path)) {
-                (_hugeFileMap(path) % _numPartitions).toInt
+                (_hugeFileMap(path) % numPartitions).toInt
               } else {
-                (size % _numPartitions).toInt
+                (size % numPartitions).toInt
               }
             case path: String =>
               if (_hugeFileMap.contains(path)) {
-                (_hugeFileMap(path) % _numPartitions).toInt
+                (_hugeFileMap(path) % numPartitions).toInt
               } else {
-                path.hashCode.abs % _numPartitions
+                path.hashCode.abs % numPartitions
               }
             case _ => 0
           }
