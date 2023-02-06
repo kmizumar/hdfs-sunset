@@ -3,12 +3,13 @@ package hdfs.sunset
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.apache.log4j.{LogManager, Logger}
 import org.apache.spark.Partitioner
-import org.apache.spark.api.java.{JavaRDD, JavaPairRDD}
+import org.apache.spark.api.java.{JavaPairRDD, JavaRDD}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK
 
-import java.io.File
+import java.io.{File, IOException}
+import java.security.{NoSuchAlgorithmException, NoSuchProviderException}
 
 object App {
   private val logger: Logger = LogManager.getLogger(this.getClass.getName)
@@ -136,18 +137,24 @@ object App {
 
       val hashPairRdd: RDD[HashPair] = pathRdd.map(s => {
           import java.security.{DigestInputStream, MessageDigest}
-          val hadoopConfig = serializableConf.get()
-          val hdfs = FileSystem.get(hadoopConfig)
-          val in = hdfs.open(new Path(s))
-          val digest = MessageDigest.getInstance("SHA-256")
           try {
-            val dis = new DigestInputStream(in, digest)
-            val buffer = new Array[Byte](hadoopConfig.getInt("dfs.blocksize", BUFFER_SIZE))
-            while (dis.read(buffer) >= 0) {}
-            dis.close()
-            HashPair(s, digest.digest.map("%02x".format(_)).mkString)
-          } finally {
-            in.close()
+            val hadoopConfig = serializableConf.get()
+            val hdfs = FileSystem.get(hadoopConfig)
+            val in = hdfs.open(new Path(s))
+            val digest = MessageDigest.getInstance("SHA-256")
+            try {
+              val dis = new DigestInputStream(in, digest)
+              val buffer = new Array[Byte](hadoopConfig.getInt("dfs.blocksize", BUFFER_SIZE))
+              while (dis.read(buffer) >= 0) {}
+              dis.close()
+              HashPair(s, digest.digest.map("%02x".format(_)).mkString)
+            } finally {
+              in.close()
+            }
+          } catch {
+            case _: IOException => HashPair(s, "0000000000000000000000000000000000000000000000000000000000000000")
+            case _: NoSuchAlgorithmException => HashPair(s, "1111111111111111111111111111111111111111111111111111111111111111")
+            case _: NoSuchProviderException => HashPair(s, "2222222222222222222222222222222222222222222222222222222222222222")
           }
       })
       hashPairRdd.saveAsTextFile(config.outputDir.toString)
